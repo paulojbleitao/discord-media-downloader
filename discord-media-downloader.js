@@ -10,8 +10,8 @@ const SERVER_NAME = 'DESIRED SERVER NAME HERE';
 const CHANNEL_NAME = 'DESIRED CHANNEL NAME HERE';
 
 let links = [];
-
 let filenames = {};
+let lastMsgId = undefined; // used to pick up where it left off if an error occurs
 
 function determineAttachmentName(attachment) {
     const fn = attachment.filename;
@@ -33,9 +33,14 @@ function retrieveAttachments(msg) {
     if (msg.attachments) {
         msg.attachments.forEach(attachment => {
             if (!fs.existsSync(CHANNEL_NAME)) fs.mkdirSync(CHANNEL_NAME);
-            const file = fs.createWriteStream(`${CHANNEL_NAME}/${determineAttachmentName(attachment)}`);
+            const name = determineAttachmentName(attachment);
+            const file = fs.createWriteStream(`${CHANNEL_NAME}/${name}`);
             const request = https.get(attachment.url, function(response) {
                 response.pipe(file);
+                response.on('error', () => {
+                    console.log(`Something went wrong when downloading ${name} at ${msg.createdAt}.`)
+                });
+                response.on('end', () => request.end());
             });
         });
     }
@@ -51,22 +56,55 @@ function retrieveLinks(msg, links) {
     }
 }
 
-client.on('ready', async () => {
-    console.log(`Attempting to download media from the ${CHANNEL_NAME} channel in ${SERVER_NAME} server...`)
-    const desiredGuild = client.guilds.filter(guild => guild.name === SERVER_NAME).array()[0];
-    const desiredChannel = desiredGuild.channels.filter(channel => channel.name === CHANNEL_NAME).array()[0];
-    let msgs = (await desiredChannel.fetchMessages()).array();
+async function fetch(channel, before = undefined) {
+    const options = before ? { before } : {};
+    try {
+        const messages = await channel.fetchMessages(options);
+        return messages.array();
+    } catch (e) {
+        console.log(`Something went wrong! Error: ${e.name}`);
+        console.log('Trying again...');
+        return await fetch(channel, before);
+    }
+}
+
+function timeout(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function iterateThroughMessages(channel, lastMsgId) {
+    let msgs = await fetch(channel, lastMsgId);
     while (msgs.length !== 0) {
         msgs.forEach(msg => { 
             retrieveAttachments(msg);
             retrieveLinks(msg, links);
         });
         const lastMsg = msgs[msgs.length - 1];
-        msgs = (await desiredChannel.fetchMessages({ before: lastMsg.id })).array();
+        lastMsgId = lastMsg.id
+        fs.writeFileSync('links.txt', links.join('\n') + '\n');
+        await timeout(500); // handling rate limiting
+        msgs = await fetch(channel, lastMsgId);
     }
+}
 
-    fs.writeFileSync('links.txt', links.join('\n') + '\n');
+
+function loginAndHandleErrors(client) {
+    try {
+        client.login(BOT_TOKEN);
+    } catch (e) {
+        console.log(`Something went wrong! Error: ${e.name}`);
+        console.log('Reconnecting...');
+        loginAndHandleErrors(client);
+    }
+}
+
+client.on('ready', async () => {
+    console.log(`Attempting to download media from the ${CHANNEL_NAME} channel in ${SERVER_NAME} server...`)
+    const desiredGuild = client.guilds.filter(guild => guild.name === SERVER_NAME).array()[0];
+    const desiredChannel = desiredGuild.channels.filter(channel => channel.name === CHANNEL_NAME).array()[0];
+    await iterateThroughMessages(desiredChannel, lastMsgId);
     console.log('All done!');
 });
 
-client.login(BOT_TOKEN);
+loginAndHandleErrors(client);
+process.on('error', () => loginAndHandleErrors(client)); // attempt to bypass random errors
